@@ -1,0 +1,12 @@
+services:
+  pea-swing:
+    build: .
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Paris
+      PEA_TELEGRAM_BOT_TOKEN: ${PEA_TELEGRAM_BOT_TOKEN:-}
+      PEA_TELEGRAM_CHAT_ID: ${PEA_TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./live_data:/app/live_data
+      - ./state:/app/state
+    command: ["run", "--data", "/app/live_data", "--state", "/app/state/alerts.sqlite3", "--strategy", "monthly10"]
