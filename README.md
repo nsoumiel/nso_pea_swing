@@ -29,6 +29,25 @@ python3 bot.py scan --data live_data
 python3 bot.py run --data live_data
 ```
 
+## Surveillance de plusieurs symboles
+
+Toutes les commandes acceptent `--symbols` suivi de symboles Yahoo séparés par des espaces. Sans cette option, `CW8.PA` reste la valeur par défaut.
+
+```bash
+python3 bot.py download --symbols CW8.PA ESE.PA --data live_data
+python3 bot.py scan --symbols CW8.PA ESE.PA --data live_data
+python3 bot.py run --symbols CW8.PA ESE.PA --data live_data
+python3 bot.py backtest --symbols CW8.PA ESE.PA --data live_data
+```
+
+Chaque symbole dispose de son fichier de cours et de son audit (`<symbole>.json` et `<symbole>.download.json`). Les signaux et la déduplication Telegram sont indépendants par symbole et stratégie. La base SQLite existante est migrée automatiquement en conservant les notifications historiques de CW8.PA. Aucun ISIN n'est supposé pour les autres symboles.
+
+Un échec sur un symbole est affiché et les autres sont traités. Les commandes ponctuelles renvoient un code d'échec si au moins un symbole échoue ; `run` poursuit ses cycles toutes les six heures. Les doublons dans la liste ne sont traités qu'une fois par cycle.
+
+Les contrôles existants restent applicables : cours en EUR uniquement et blocage des opérations sur titres. Vérifiez vous-même l'identité et l'éligibilité PEA des instruments. Chaque backtest simule un capital indépendant de 5 000 €, sans allocation commune entre symboles. Avec plusieurs symboles, les sorties sont séparées dans `results/<symbole>/` ; avec un seul symbole, le chemin historique est conservé. `plot_results.py` reste prévu pour les résultats au chemin historique.
+
+Avec Docker Compose, ajouter les arguments `"--symbols", "CW8.PA", "ESE.PA"` à la liste `command` de `compose.yml`.
+
 ## Docker / Synology
 
 Depuis ce même dossier, sur un hôte ayant Docker Compose :

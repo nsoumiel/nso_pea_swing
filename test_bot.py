@@ -59,5 +59,73 @@ class Tests(unittest.TestCase):
             state=str(pathlib.Path(p)/'state.db')
             self.assertRaises(RuntimeError,scan,p,state,'monthly10',True,dt.datetime(2021,2,24,tzinfo=ZoneInfo('Europe/Paris')))
             with sqlite3.connect(state) as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM notifications').fetchone()[0],0)
+class MultiSymbolTests(unittest.TestCase):
+    def test_notifications_independent_and_legacy_migration(self):
+        now=dt.datetime(2021,2,24,tzinfo=ZoneInfo('Europe/Paris'))
+        with tempfile.TemporaryDirectory() as p, patch('bot.load',return_value=rows(420)), patch.dict(os.environ,{'PEA_TELEGRAM_BOT_TOKEN':'test','PEA_TELEGRAM_CHAT_ID':'test'}), patch('bot.urllib.request.urlopen',side_effect=lambda *a,**k: io.BytesIO(b'{"ok":true}')) as send:
+            state=str(pathlib.Path(p)/'state.db')
+            with sqlite3.connect(state) as db:
+                db.execute('CREATE TABLE notifications (strategy TEXT PRIMARY KEY, regime INTEGER, sent_at TEXT)')
+                db.execute('INSERT INTO notifications VALUES (?,?,?)',('monthly10',0,'2021-02-23'))
+            scan(p,state,'monthly10',True,now)
+            scan(p,state,'monthly10',True,now,symbol='ESE.PA')
+            scan(p,state,'monthly10',True,now,symbol='ESE.PA')
+            self.assertEqual(send.call_count,1)
+            message=json.loads(send.call_args.args[0].data)['text']
+            self.assertIn('ESE.PA',message)
+            self.assertNotIn('LU1681043599',message)
+            with sqlite3.connect(state) as db:
+                self.assertEqual(db.execute('SELECT symbol FROM notifications ORDER BY symbol').fetchall(),[('CW8.PA',),('ESE.PA',)])
+
+    def test_download_files_separate(self):
+        from bot import download
+        payload={'chart':{'result':[{'meta':{'currency':'EUR','dataGranularity':'1d'},'timestamp':[1609459200],'indicators':{'quote':[{'open':[100.],'high':[101.],'low':[99.],'close':[100.]}]}}]}}
+        with tempfile.TemporaryDirectory() as p, patch('bot.urllib.request.urlopen',side_effect=lambda *a,**k: io.BytesIO(json.dumps(payload).encode())) as request:
+            for symbol in ['CW8.PA','ESE.PA']:
+                download(p,symbol)
+                self.assertEqual(len(load(pathlib.Path(p)/f'{symbol}.json')),1)
+                self.assertIn(symbol,json.loads((pathlib.Path(p)/f'{symbol}.download.json').read_text())['url'])
+            self.assertIn('/ESE.PA?',request.call_args.args[0].full_url)
+
+    def test_failure_does_not_block_other_symbols(self):
+        from bot import process_symbols
+        from argparse import Namespace
+        args=Namespace(command='run',symbols=['CW8.PA','ESE.PA','ESE.PA'],data='data',state='state.db',strategy='monthly10',telegram=False)
+        with patch('bot.download',side_effect=[OSError('network'),None]) as download, patch('bot.scan') as scan_mock:
+            self.assertFalse(process_symbols(args))
+            self.assertEqual(download.call_count,2)
+            self.assertEqual(scan_mock.call_count,1)
+            self.assertEqual(scan_mock.call_args.kwargs['symbol'],'ESE.PA')
+
+    def test_backtest_outputs_separate(self):
+        from bot import process_symbols
+        from argparse import Namespace
+        history=rows(800)
+        history=[dict(r,date=(dt.date(2011,1,1)+dt.timedelta(days=i)).isoformat()) for i,r in enumerate(history)]+rows(800)
+        with tempfile.TemporaryDirectory() as p, patch('bot.load',return_value=history), patch('builtins.print'):
+            args=Namespace(command='backtest',symbols=['CW8.PA','ESE.PA'],data=p,out=p)
+            self.assertTrue(process_symbols(args))
+            for symbol in args.symbols:
+                summary=json.loads((pathlib.Path(p)/symbol/'summary.json').read_text())
+                self.assertEqual(len(summary),12)
+                self.assertTrue((pathlib.Path(p)/symbol/'validation_monthly10_equity.csv').exists())
+
+    def test_invalid_symbols_rejected(self):
+        from bot import valid_symbol
+        import argparse
+        for symbol in ['../secret','/tmp/a','A/B','', 'A?x=1']:
+            with self.assertRaises(argparse.ArgumentTypeError):valid_symbol(symbol)
+
+    def test_cli_scan_two_symbols(self):
+        import subprocess,sys
+        payload={'chart':{'result':[{'meta':{'currency':'EUR','dataGranularity':'1d'},'timestamp':[int((dt.datetime.now(dt.timezone.utc)-dt.timedelta(days=1)).timestamp())],'indicators':{'quote':[{'open':[100.],'high':[101.],'low':[99.],'close':[100.]}]}}]}}
+        with tempfile.TemporaryDirectory() as p:
+            for symbol in ['CW8.PA','ESE.PA']:
+                (pathlib.Path(p)/f'{symbol}.json').write_text(json.dumps(payload))
+            result=subprocess.run([sys.executable,'bot.py','scan','--symbols','CW8.PA','ESE.PA','--data',p,'--state',str(pathlib.Path(p)/'state.db')],capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            self.assertIn('CW8.PA',result.stdout);self.assertIn('ESE.PA',result.stdout)
+            self.assertEqual(result.stdout.count('Notification: non envoyée'),2)
+
 if __name__=='__main__':unittest.main()
 

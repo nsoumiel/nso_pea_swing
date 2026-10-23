@@ -1,5 +1,5 @@
 """PEA Swing v1: recherche et alertes, jamais d'ordres courtier. Python >=3.11."""
-import argparse, csv, datetime as dt, hashlib, json, math, os, pathlib, sqlite3, time, urllib.request
+import argparse, csv, datetime as dt, hashlib, json, math, os, pathlib, sqlite3, time, urllib.request, re
 from zoneinfo import ZoneInfo
 ROOT=pathlib.Path(__file__).resolve().parent
 SYMBOL='CW8.PA'
@@ -27,15 +27,21 @@ def load(path):
     if rows!=sorted(rows,key=lambda x:x['date']):raise ValueError('Dates non ordonnées')
     return rows
 
-def download(folder):
+def valid_symbol(value):
+    if not re.fullmatch(r'[A-Za-z0-9^][A-Za-z0-9.^=_-]*',value):
+        raise argparse.ArgumentTypeError('Symbole Yahoo invalide')
+    return value
+
+def download(folder,symbol=SYMBOL):
+    valid_symbol(symbol)
     folder=pathlib.Path(folder);folder.mkdir(parents=True,exist_ok=True)
     end=int(dt.datetime.now(dt.timezone.utc).timestamp())
-    url=f'https://query1.finance.yahoo.com/v8/finance/chart/{SYMBOL}?period1=1230768000&period2={end}&interval=1d&events=div,splits'
+    url=f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?period1=1230768000&period2={end}&interval=1d&events=div,splits'
     request=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'})
     with urllib.request.urlopen(request,timeout=40) as response:raw=response.read()
-    tmp=folder/'download.tmp';tmp.write_bytes(raw);load(tmp)
-    tmp.replace(folder/f'{SYMBOL}.json')
-    (folder/'download.json').write_text(json.dumps({'utc':dt.datetime.now(dt.timezone.utc).isoformat(),'url':url,'sha256':hashlib.sha256(raw).hexdigest()},indent=2))
+    tmp=folder/f'{symbol}.download.tmp';tmp.write_bytes(raw);load(tmp)
+    tmp.replace(folder/f'{symbol}.json')
+    (folder/f'{symbol}.download.json').write_text(json.dumps({'utc':dt.datetime.now(dt.timezone.utc).isoformat(),'url':url,'sha256':hashlib.sha256(raw).hexdigest()},indent=2))
 
 def target(history,asof,strategy):
     """Target for an opening on asof; history must strictly precede asof."""
@@ -93,8 +99,9 @@ def write_csv(path,rows):
     with open(path,'w',newline='') as f:
         w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
 
-def research(folder,out):
-    rows=load(pathlib.Path(folder)/f'{SYMBOL}.json');out=pathlib.Path(out);out.mkdir(parents=True,exist_ok=True)
+def research(folder,out,symbol=SYMBOL):
+    valid_symbol(symbol)
+    rows=load(pathlib.Path(folder)/f'{symbol}.json');out=pathlib.Path(out);out.mkdir(parents=True,exist_ok=True)
     stats=[]
     for label,start,end in [('full','2011-01-01','2026-10-20'),('development','2011-01-01','2019-12-31'),('validation','2020-01-01','2026-10-20')]:
         for strategy in ['monthly10','weekly200','buy_hold']:
@@ -106,19 +113,29 @@ def research(folder,out):
     write_csv(out/'summary.csv',stats);(out/'summary.json').write_text(json.dumps(stats,indent=2))
     print(json.dumps(stats,indent=2))
 
-def scan(folder,state,strategy,notify=False,now=None):
+def scan(folder,state,strategy,notify=False,now=None,symbol=SYMBOL):
+    valid_symbol(symbol)
     now=now or dt.datetime.now(ZoneInfo('Europe/Paris'))
     # Conservative: yesterday at latest, including when run during an open session.
-    rows=[r for r in load(pathlib.Path(folder)/f'{SYMBOL}.json') if r['date']<now.date().isoformat()]
+    rows=[r for r in load(pathlib.Path(folder)/f'{symbol}.json') if r['date']<now.date().isoformat()]
     if not rows or (now.date()-dt.date.fromisoformat(rows[-1]['date'])).days>4:raise ValueError('Cours trop anciens: aucune alerte autorisée')
     want=target(rows,now.date().isoformat(),strategy)
     # No assumed holdings: this is a model regime, not an order or quantity.
-    text=f'PEA Swing | {strategy} | {SYMBOL} {ISIN}\nRégime cible: {"INVESTI" if want else "LIQUIDITÉS"}\nCours contrôlé: {rows[-1]["date"]}, {rows[-1]["close"]:.2f} EUR\nSignal informatif. Vérifier vos positions et le prix chez Bourse Direct; exécution manuelle uniquement.'
+    identity=f'{symbol} {ISIN}' if symbol==SYMBOL else symbol
+    text=f'PEA Swing | {strategy} | {identity}\nRégime cible: {"INVESTI" if want else "LIQUIDITÉS"}\nCours contrôlé: {rows[-1]["date"]}, {rows[-1]["close"]:.2f} EUR\nSignal informatif. Vérifier vos positions et le prix chez Bourse Direct; exécution manuelle uniquement.'
     pathlib.Path(state).parent.mkdir(parents=True,exist_ok=True)
     with sqlite3.connect(state,timeout=30) as db:
-        db.execute('CREATE TABLE IF NOT EXISTS notifications (strategy TEXT PRIMARY KEY, regime INTEGER, sent_at TEXT)')
         db.execute('BEGIN IMMEDIATE')
-        old=db.execute('SELECT regime FROM notifications WHERE strategy=?',(strategy,)).fetchone()
+        columns=[r[1] for r in db.execute('PRAGMA table_info(notifications)')]
+        if columns and 'symbol' not in columns:
+            db.execute('ALTER TABLE notifications RENAME TO notifications_legacy')
+        db.execute('CREATE TABLE IF NOT EXISTS notifications (symbol TEXT, strategy TEXT, regime INTEGER, sent_at TEXT, PRIMARY KEY (symbol,strategy))')
+        if columns and 'symbol' not in columns:
+            db.execute('INSERT INTO notifications SELECT ?,strategy,regime,sent_at FROM notifications_legacy',(SYMBOL,))
+            db.execute('DROP TABLE notifications_legacy')
+        db.commit()
+        db.execute('BEGIN IMMEDIATE')
+        old=db.execute('SELECT regime FROM notifications WHERE symbol=? AND strategy=?',(symbol,strategy)).fetchone()
         changed=old is None or old[0]!=int(want)
         if notify and changed:
             token=os.environ.get('PEA_TELEGRAM_BOT_TOKEN');chat=os.environ.get('PEA_TELEGRAM_CHAT_ID')
@@ -128,19 +145,41 @@ def scan(folder,state,strategy,notify=False,now=None):
                 with urllib.request.urlopen(req,timeout=20) as response:answer=json.load(response)
                 if not answer.get('ok'):raise RuntimeError()
             except Exception:raise RuntimeError('Échec Telegram, vérifier la connexion et les identifiants') from None
-            db.execute('INSERT OR REPLACE INTO notifications VALUES (?,?,?)',(strategy,int(want),now.isoformat()))
+            db.execute('INSERT OR REPLACE INTO notifications VALUES (?,?,?,?)',(symbol,strategy,int(want),now.isoformat()))
     print(text+'\nNotification: '+('envoyée' if notify and changed else 'non envoyée'),flush=True)
     return want
 
+def process_symbols(a):
+    failed=False
+    for symbol in dict.fromkeys(a.symbols):
+        try:
+            if a.command in ('download','run'):
+                download(a.data,symbol)
+            if a.command=='backtest':
+                out=pathlib.Path(a.out)/symbol if len(set(a.symbols))>1 else a.out
+                research(a.data,out,symbol)
+            elif a.command in ('scan','run'):
+                scan(a.data,a.state,a.strategy,a.telegram,symbol=symbol)
+        except Exception as e:
+            print(f'ERREUR {symbol} {type(e).__name__}: {e}',flush=True)
+            failed=True
+    return not failed
+
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['download','backtest','scan','run']);p.add_argument('--data',default=str(ROOT/'data'));p.add_argument('--out',default=str(ROOT/'results'));p.add_argument('--state',default=str(ROOT/'state/alerts.sqlite3'));p.add_argument('--strategy',choices=['monthly10','weekly200'],default='monthly10');p.add_argument('--telegram',action='store_true');a=p.parse_args()
-    if a.command=='download':download(a.data)
-    elif a.command=='backtest':research(a.data,a.out)
-    elif a.command=='scan':scan(a.data,a.state,a.strategy,a.telegram)
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('command',choices=['download','backtest','scan','run'])
+    p.add_argument('--symbols',nargs='+',type=valid_symbol,default=[SYMBOL],help='Symboles Yahoo, séparés par des espaces (défaut: CW8.PA)')
+    p.add_argument('--data',default=str(ROOT/'data'))
+    p.add_argument('--out',default=str(ROOT/'results'))
+    p.add_argument('--state',default=str(ROOT/'state/alerts.sqlite3'))
+    p.add_argument('--strategy',choices=['monthly10','weekly200'],default='monthly10')
+    p.add_argument('--telegram',action='store_true')
+    a=p.parse_args()
+    if a.command!='run':
+        if not process_symbols(a):
+            raise SystemExit(1)
     else:
         while True:
-            try:
-                download(a.data);scan(a.data,a.state,a.strategy,a.telegram)
-            except Exception as e:print(f'ERREUR {type(e).__name__}: {e}',flush=True)
+            process_symbols(a)
             time.sleep(21600)
 if __name__=='__main__':main()
